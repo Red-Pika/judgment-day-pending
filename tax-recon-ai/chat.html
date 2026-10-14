@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tax Recon Chatbot</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --surface: #ffffff; --text: #1a1d21; --muted: #6b7280;
+    --border: #e3e6ea; --accent: #0f766e; --accent-text: #ffffff; --bot: #eef1f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --surface: #1a1e24; --text: #e8eaed; --muted: #9aa3af;
+      --border: #2b313a; --accent: #2dd4bf; --accent-text: #04201c; --bot: #242a32;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; }
+  header { padding: 12px 16px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  header h1 { font-size: 16px; margin: 0; }
+  header small { color: var(--muted); }
+  #setup { padding: 16px; display: grid; gap: 8px; max-width: 520px; margin: 24px auto; width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
+  #setup h2 { margin: 0 0 4px; font-size: 16px; }
+  #setup p { margin: 0 0 4px; color: var(--muted); font-size: 13px; }
+  input, button { font: inherit; }
+  input[type=text], input[type=password], input[type=url] { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
+  button { padding: 10px 16px; border: 0; border-radius: 8px; background: var(--accent); color: var(--accent-text); font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #chat { flex: 1; display: none; flex-direction: column; min-height: 0; max-width: 820px; width: 100%; margin: 0 auto; }
+  #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 14px; word-wrap: break-word; overflow-wrap: anywhere; }
+  .msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-text); border-bottom-right-radius: 4px; }
+  .msg.bot { align-self: flex-start; background: var(--bot); border-bottom-left-radius: 4px; }
+  .msg.err { align-self: center; background: transparent; color: #dc2626; border: 1px solid #dc2626; font-size: 13px; }
+  .msg code { background: rgba(127,127,127,.2); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 16px 8px; }
+  .chips button { background: var(--surface); color: var(--text); border: 1px solid var(--border); font-weight: 400; font-size: 13px; padding: 6px 12px; border-radius: 999px; }
+  form#composer { display: flex; gap: 8px; padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--border); background: var(--surface); }
+  form#composer input { flex: 1; }
+  .dots span { display: inline-block; width: 6px; height: 6px; margin: 0 2px; border-radius: 50%; background: var(--muted); animation: b 1s infinite; }
+  .dots span:nth-child(2) { animation-delay: .15s; } .dots span:nth-child(3) { animation-delay: .3s; }
+  @keyframes b { 0%, 80%, 100% { opacity: .3; } 40% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .dots span { animation: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tax Recon Chatbot</h1>
+  <small>Jawaban angka berasal dari database, bukan tebakan AI</small>
+</header>
+
+<section id="setup">
+  <h2>Hubungkan ke n8n</h2>
+  <p>Isi Production URL dari node Chat Trigger (workflow 2) dan login yang Anda buat di credential Basic Auth. Login hanya disimpan di memori halaman ini.</p>
+  <input id="url" type="url" placeholder="https://n8n.contoh.com/webhook/xxxx/chat" autocomplete="off">
+  <input id="user" type="text" placeholder="Username" autocomplete="username">
+  <input id="pass" type="password" placeholder="Password" autocomplete="current-password">
+  <button id="connect" type="button">Mulai chat</button>
+</section>
+
+<section id="chat">
+  <div id="messages" aria-live="polite"></div>
+  <div class="chips" id="chips"></div>
+  <form id="composer">
+    <input id="input" type="text" placeholder="Tanya soal hasil rekonsiliasi..." autocomplete="off" aria-label="Pesan">
+    <button id="send" type="submit">Kirim</button>
+  </form>
+</section>
+
+<script>
+  // Isi default bila ingin (atau pakai ?url=https://... di alamat halaman).
+  const CONFIG = { webhookUrl: '' };
+
+  const $ = (id) => document.getElementById(id);
+  const state = { url: '', auth: '', sessionId: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)), busy: false };
+  const SUGGESTIONS = ['Ringkasan rekonsiliasi terakhir', 'Tampilkan 5 selisih terbesar', 'Dokumen mana yang hanya ada di sumber A?', 'Dokumen mana yang kunci gandanya?'];
+
+  // Escape HTML dulu (anti-XSS), baru terapkan format sederhana.
+  function formatMessage(text) {
+    return String(text)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/^\s*[-*] /gm, '\u2022 ')
+      .replace(/\n/g, '<br>');
+  }
+
+  function addMessage(kind, text) {
+    const el = document.createElement('div');
+    el.className = 'msg ' + kind;
+    if (kind === 'user' || kind === 'err') el.textContent = text; else el.innerHTML = formatMessage(text);
+    $('messages').appendChild(el);
+    $('messages').scrollTop = $('messages').scrollHeight;
+    return el;
+  }
+
+  function toBase64(str) {
+    const bytes = new TextEncoder().encode(str);
+    let bin = '';
+    bytes.forEach((b) => { bin += String.fromCharCode(b); });
+    return btoa(bin);
+  }
+
+  function extractReply(raw) {
+    try {
+      const data = JSON.parse(raw);
+      if (typeof data === 'string') return data;
+      return data.output || data.text || data.message || JSON.stringify(data);
+    } catch (e) {
+      return raw; // bukan JSON, tampilkan apa adanya
+    }
+  }
+
+  async function send(text) {
+    text = text.trim();
+    if (!text || state.busy) return;
+    state.busy = true;
+    $('send').disabled = true;
+    addMessage('user', text);
+    const typing = addMessage('bot', '');
+    typing.innerHTML = '<span class="dots"><span></span><span></span><span></span></span>';
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (state.auth) headers.Authorization = state.auth;
+      const res = await fetch(state.url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ action: 'sendMessage', sessionId: state.sessionId, chatInput: text }),
+      });
+      const raw = await res.text();
+      typing.remove();
+      if (res.status === 401 || res.status === 403) addMessage('err', 'Login ditolak. Periksa username dan password.');
+      else if (!res.ok) addMessage('err', 'Server membalas error ' + res.status + '. Pastikan workflow 2 sudah aktif (Active).');
+      else addMessage('bot', extractReply(raw));
+    } catch (e) {
+      typing.remove();
+      addMessage('err', 'Tidak bisa terhubung. Periksa URL, pastikan n8n memakai HTTPS, dan allowedOrigins mengizinkan domain halaman ini.');
+    } finally {
+      state.busy = false;
+      $('send').disabled = false;
+      $('input').focus();
+    }
+  }
+
+  function start() {
+    const url = $('url').value.trim();
+    if (!/^https?:\/\//i.test(url)) { $('url').focus(); return; }
+    state.url = url;
+    const u = $('user').value, p = $('pass').value;
+    state.auth = u || p ? 'Basic ' + toBase64(u + ':' + p) : '';
+    $('pass').value = '';
+    $('setup').style.display = 'none';
+    $('chat').style.display = 'flex';
+    addMessage('bot', 'Halo! Saya bisa membantu membaca hasil rekonsiliasi terbaru: ringkasan, daftar selisih, dan pencarian nomor faktur. Angka yang saya sebut diambil langsung dari database.');
+    $('input').focus();
+  }
+
+  $('url').value = new URLSearchParams(location.search).get('url') || CONFIG.webhookUrl;
+  $('connect').addEventListener('click', start);
+  $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') start(); });
+  $('composer').addEventListener('submit', (e) => { e.preventDefault(); const t = $('input').value; $('input').value = ''; send(t); });
+  SUGGESTIONS.forEach((s) => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = s;
+    b.addEventListener('click', () => send(s));
+    $('chips').appendChild(b);
+  });
+</script>
+</body>
+</html>
