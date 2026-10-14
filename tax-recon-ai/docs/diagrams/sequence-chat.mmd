@@ -1,0 +1,23 @@
+sequenceDiagram
+  autonumber
+  participant U as web/chat.html
+  participant T as Chat Trigger
+  participant A as AI Agent
+  participant M as Chat Memory
+  participant S as Tool SQL
+  participant D as PostgreSQL
+  participant L as Bedrock
+  U->>T: POST {action, sessionId, chatInput} + Basic Auth
+  T-->>U: 401 jika login salah
+  T->>A: chatInput + sessionId
+  A->>M: ambil riwayat (10 pesan terakhir)
+  A->>L: prompt sistem + riwayat + daftar tool
+  L-->>A: panggil tool (mis. cari_selisih)
+  A->>S: parameter dari AI (status, jumlah)
+  S->>D: query tetap, terparameter ($1, $2)
+  D-->>S: baris hasil
+  S-->>A: data
+  A->>L: data tool
+  L-->>A: jawaban akhir (angka dikutip dari data)
+  A->>M: simpan percakapan
+  A-->>U: {output: jawaban}

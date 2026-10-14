@@ -1,0 +1,248 @@
+{
+  "name": "Tax Recon - 2 Chatbot",
+  "nodes": [
+    {
+      "parameters": {
+        "public": true,
+        "mode": "webhook",
+        "authentication": "basicAuth",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "c09fe473-69ee-b9e9-3227-2fcf9c5809ee",
+      "name": "Chat Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "04ba7e67-b64c-2ae9-b26a-cf0a70c1521b",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "Basic Auth - Chatbot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {
+          "systemMessage": "Kamu adalah asisten AI rekonsiliasi pajak. Kamu menjawab pertanyaan tentang hasil rekonsiliasi yang tersimpan di database.\n\nATURAN PENTING:\n1. Untuk SETIAP pertanyaan berisi angka, daftar dokumen, jumlah, atau total, WAJIB pakai tool. Jangan menebak dan jangan menghitung dari ingatan.\n2. Kutip angka persis dari hasil tool. Jangan membulatkan atau menjumlahkan sendiri.\n3. Jika tool tidak mengembalikan data, katakan datanya tidak ditemukan. Jangan mengarang.\n4. Kamu hanya membaca data (tidak mengubah apa pun).\n5. Kamu bukan penasihat pajak. Untuk pertanyaan tentang aturan atau perlakuan fiskal, jelaskan secara umum dan sarankan konfirmasi ke konsultan pajak atau peraturan terbaru.\n6. Jawab dalam Bahasa Indonesia, singkat dan jelas. Gunakan format Rp dengan pemisah ribuan titik.\n\nTOOL YANG TERSEDIA:\n- ringkasan_terakhir: ringkasan dan penjelasan AI dari proses rekonsiliasi terbaru.\n- cari_selisih: daftar dokumen bermasalah pada proses terbaru, bisa difilter status dan jumlah baris. diff = A - B.\n- cari_dokumen: cari dokumen berdasarkan sebagian nomor faktur/invoice pada proses terbaru.\n\nSTATUS: MATCH, MATCH_ROUNDING, AMOUNT_MISMATCH, PERIOD_MISMATCH, ONLY_IN_A, ONLY_IN_B, DUPLICATE_KEY.",
+          "maxIterations": 6
+        }
+      },
+      "id": "9fbe974c-428d-7172-befb-f5240da31cff",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        300,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "options": {
+          "temperature": 0.1,
+          "maxTokensToSample": 2000
+        }
+      },
+      "id": "9d15477f-d781-c1cf-fb33-8560eac18469",
+      "name": "Bedrock Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAwsBedrock",
+      "typeVersion": 1,
+      "position": [
+        100,
+        420
+      ],
+      "credentials": {
+        "aws": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "AWS - Bedrock"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "tableName": "n8n_chat_histories",
+        "contextWindowLength": 10
+      },
+      "id": "c27cb677-bf68-e34e-bb64-651588a7d897",
+      "name": "Postgres Chat Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.3,
+      "position": [
+        330,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "Postgres - taxrecon"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Ringkasan hasil rekonsiliasi terbaru: jumlah dokumen, jumlah per status, total DPP/PPN, dan penjelasan AI. Tanpa parameter.",
+        "operation": "executeQuery",
+        "query": "SELECT run_id, created_at, tolerance, total_a, total_b, summary, ai_explanation\nFROM recon_runs\nORDER BY created_at DESC\nLIMIT 1",
+        "options": {}
+      },
+      "id": "4c6117b6-54bf-3e84-abc4-1f5449da5b70",
+      "name": "ringkasan_terakhir",
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.5,
+      "position": [
+        600,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "Postgres - taxrecon"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Daftar dokumen yang bermasalah (bukan MATCH) pada rekonsiliasi terbaru, urut selisih terbesar. diff = A - B. Parameter: status (SEMUA, MATCH_ROUNDING, AMOUNT_MISMATCH, PERIOD_MISMATCH, ONLY_IN_A, ONLY_IN_B, DUPLICATE_KEY) dan jumlah baris.",
+        "operation": "executeQuery",
+        "query": "SELECT invoice_no, npwp, status, dpp_a, dpp_b, diff_dpp, ppn_a, ppn_b, diff_ppn, notes\nFROM recon_results\nWHERE run_id = (SELECT run_id FROM recon_runs ORDER BY created_at DESC LIMIT 1)\n  AND status <> 'MATCH'\n  AND ($1::text = 'SEMUA' OR status = $1::text)\nORDER BY ABS(COALESCE(diff_dpp,0)) + ABS(COALESCE(diff_ppn,0)) DESC\nLIMIT $2::int",
+        "options": {
+          "queryReplacement": "={{ [ $fromAI('status', 'Filter status. Salah satu: SEMUA, MATCH_ROUNDING, AMOUNT_MISMATCH, PERIOD_MISMATCH, ONLY_IN_A, ONLY_IN_B, DUPLICATE_KEY. Default SEMUA', 'string'), $fromAI('jumlah_baris', 'Jumlah baris maksimal, default 10, maksimal 50', 'number') ] }}"
+        }
+      },
+      "id": "1270273c-4de2-b75f-7088-d30c2efe6087",
+      "name": "cari_selisih",
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.5,
+      "position": [
+        600,
+        560
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "Postgres - taxrecon"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Cari dokumen pada rekonsiliasi terbaru berdasarkan sebagian nomor faktur/invoice. Parameter: potongan_nomor.",
+        "operation": "executeQuery",
+        "query": "SELECT invoice_no, npwp, status, date_a, date_b, dpp_a, dpp_b, diff_dpp, ppn_a, ppn_b, diff_ppn, notes\nFROM recon_results\nWHERE run_id = (SELECT run_id FROM recon_runs ORDER BY created_at DESC LIMIT 1)\n  AND invoice_no ILIKE '%' || $1::text || '%'\nORDER BY invoice_no\nLIMIT 20",
+        "options": {
+          "queryReplacement": "={{ [ $fromAI('potongan_nomor', 'Sebagian nomor faktur atau invoice yang dicari', 'string') ] }}"
+        }
+      },
+      "id": "5f208e9f-a126-49cf-2932-8fc165cff158",
+      "name": "cari_dokumen",
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.5,
+      "position": [
+        600,
+        700
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "Postgres - taxrecon"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "width": 700,
+        "height": 300,
+        "content": "## Tax Recon - Workflow 2: Chatbot\n1. Pilih credential Postgres & AWS di node Chat Memory, 3 tool SQL, dan Bedrock Chat Model; pilih model Bedrock Anda.\n2. Jalankan Workflow 1 minimal sekali agar tabel berisi data. Buat credential **Basic Auth** (username/password login chat) di node Chat Trigger.\n3. Aktifkan workflow, salin **Production URL** Chat Trigger, lalu pakai di `web/chat.html`.\n4. Tool memakai **query terparameter yang tetap** (bukan SQL buatan AI) sehingga aman dari SQL injection.\n5. Untuk 3 tool SQL, disarankan credential Postgres **read-only** (lihat db/init.sql). Chat Memory butuh credential yang bisa menulis."
+      },
+      "id": "9f09aefd-0dd4-ed43-80dd-1a8415473b55",
+      "name": "Catatan",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        -160
+      ]
+    }
+  ],
+  "connections": {
+    "Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bedrock Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres Chat Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ringkasan_terakhir": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "cari_selisih": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "cari_dokumen": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

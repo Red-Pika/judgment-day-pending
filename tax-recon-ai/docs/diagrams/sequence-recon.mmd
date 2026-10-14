@@ -1,0 +1,23 @@
+sequenceDiagram
+  autonumber
+  participant U as Pengguna
+  participant W as Webhook
+  participant C as Code (core.js)
+  participant D as PostgreSQL
+  participant L as Bedrock (LLM)
+  U->>W: POST fileA, fileB, tolerance
+  W->>C: binary + opsi
+  C->>C: parse CSV, normalisasi, cocokkan, hitung selisih
+  par simpan hasil
+    C->>D: INSERT recon_results (per baris)
+  and jelaskan
+    C->>C: pilih maks 50 selisih terbesar
+    alt ada selisih
+      C->>L: ringkasan + daftar selisih (angka final)
+      L-->>C: penjelasan & saran
+    else tidak ada selisih
+      C->>C: teks default
+    end
+  end
+  C->>D: INSERT recon_runs (ringkasan + penjelasan)
+  C-->>U: JSON: summary, top_discrepancies, ai_explanation

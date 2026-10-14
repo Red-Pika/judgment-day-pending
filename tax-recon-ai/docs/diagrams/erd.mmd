@@ -1,0 +1,34 @@
+erDiagram
+  recon_runs ||--o{ recon_results : "run_id (tanpa FK)"
+  recon_runs {
+    uuid run_id PK
+    timestamptz created_at
+    numeric tolerance
+    int total_a
+    int total_b
+    jsonb summary
+    text ai_explanation
+  }
+  recon_results {
+    bigserial id PK
+    uuid run_id
+    text status
+    text invoice_no
+    text npwp
+    date date_a
+    date date_b
+    numeric dpp_a
+    numeric dpp_b
+    numeric diff_dpp
+    numeric ppn_a
+    numeric ppn_b
+    numeric diff_ppn
+    text notes
+    int row_a
+    int row_b
+  }
+  n8n_chat_histories {
+    int id PK
+    varchar session_id
+    jsonb message
+  }

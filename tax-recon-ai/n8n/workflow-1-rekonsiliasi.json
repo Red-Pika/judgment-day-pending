@@ -1,0 +1,396 @@
+{
+  "name": "Tax Recon - 1 Rekonsiliasi",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "tax-recon",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "13355b24-b076-f692-d7a6-86709f492b6b",
+      "name": "Webhook Upload",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "110308dd-3713-b512-c977-0bee758ae94b",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "Header Auth - Upload"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Tax Recon AI - core logic (deterministik, TANPA LLM).\n *\n * File ini sengaja ditulis tanpa dependency dan tanpa require(), sehingga:\n *   1. bisa dipakai di Node.js (CLI + unit test), dan\n *   2. bisa di-embed langsung ke node \"Code\" n8n (lihat scripts/build-n8n.js).\n *\n * Semua perhitungan angka dilakukan di sini. LLM hanya dipakai untuk\n * MENJELASKAN hasil, tidak pernah untuk menghitung atau membandingkan.\n */\nconst TaxRecon = (() => {\n  'use strict';\n\n  const STATUSES = [\n    'MATCH',\n    'MATCH_ROUNDING',\n    'AMOUNT_MISMATCH',\n    'PERIOD_MISMATCH',\n    'ONLY_IN_A',\n    'ONLY_IN_B',\n    'DUPLICATE_KEY',\n  ];\n\n  const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;\n  const pad2 = (n) => String(n).padStart(2, '0');\n\n  // ---------------------------------------------------------------- CSV\n  function detectDelimiter(headerLine) {\n    const counts = { ',': 0, ';': 0, '\\t': 0 };\n    let inQuote = false;\n    for (const ch of headerLine) {\n      if (ch === '\"') inQuote = !inQuote;\n      else if (!inQuote && Object.prototype.hasOwnProperty.call(counts, ch)) counts[ch]++;\n    }\n    return Object.entries(counts).sort((x, y) => y[1] - x[1])[0][0];\n  }\n\n  /** Parser CSV kecil: mendukung kutip ganda, delimiter , ; dan tab. Baris pertama = header. */\n  function parseCsv(text) {\n    text = String(text).replace(/^\\uFEFF/, '');\n    const delim = detectDelimiter(text.split(/\\r?\\n/, 1)[0] || '');\n    const rows = [];\n    let row = [];\n    let field = '';\n    let inQuote = false;\n    for (let i = 0; i < text.length; i++) {\n      const ch = text[i];\n      if (inQuote) {\n        if (ch === '\"') {\n          if (text[i + 1] === '\"') { field += '\"'; i++; } else inQuote = false;\n        } else field += ch;\n      } else if (ch === '\"') {\n        inQuote = true;\n      } else if (ch === delim) {\n        row.push(field); field = '';\n      } else if (ch === '\\n' || ch === '\\r') {\n        if (ch === '\\r' && text[i + 1] === '\\n') i++;\n        row.push(field); field = '';\n        rows.push(row); row = [];\n      } else field += ch;\n    }\n    if (field !== '' || row.length) { row.push(field); rows.push(row); }\n\n    const nonEmpty = rows.filter((r) => r.some((c) => String(c).trim() !== ''));\n    if (!nonEmpty.length) return [];\n    const headers = nonEmpty[0].map((h) => String(h).trim());\n    return nonEmpty.slice(1).map((r, idx) => {\n      const o = { __row: idx + 2 }; // nomor baris di file asli (header = baris 1)\n      headers.forEach((h, i) => { o[h] = r[i] !== undefined ? String(r[i]).trim() : ''; });\n      return o;\n    });\n  }\n\n  function toCsv(rows, columns) {\n    const esc = (v) => {\n      if (v === null || v === undefined) return '';\n      const s = String(v);\n      return /[\",\\n\\r;]/.test(s) ? `\"${s.replace(/\"/g, '\"\"')}\"` : s;\n    };\n    return [columns.join(',')]\n      .concat(rows.map((r) => columns.map((c) => esc(r[c])).join(',')))\n      .join('\\n');\n  }\n\n  // -------------------------------------------------------- Normalisasi\n  function autoNormalize(s) {\n    const lastDot = s.lastIndexOf('.');\n    const lastComma = s.lastIndexOf(',');\n    if (lastDot >= 0 && lastComma >= 0) {\n      const dec = lastDot > lastComma ? '.' : ',';\n      const thou = dec === '.' ? ',' : '.';\n      return s.split(thou).join('').replace(dec, '.');\n    }\n    const sep = lastDot >= 0 ? '.' : lastComma >= 0 ? ',' : null;\n    if (!sep) return s;\n    const count = s.split(sep).length - 1;\n    const after = s.length - s.lastIndexOf(sep) - 1;\n    // Ambigu (\"1.234\"): 3 digit di belakang separator dianggap pemisah ribuan.\n    if (count > 1 || after === 3) return s.split(sep).join('');\n    return s.replace(sep, '.');\n  }\n\n  /**\n   * Ubah teks angka jadi Number.\n   * locale 'id'  : titik = ribuan, koma = desimal  (10.000.000,50)   <- default\n   * locale 'en'  : koma = ribuan, titik = desimal  (10,000,000.50)\n   * locale 'auto': tebak otomatis (kurang aman untuk angka ambigu)\n   * Mendukung awalan \"Rp\"/\"IDR\", tanda minus, dan negatif dalam kurung (1.000).\n   */\n  function parseAmount(value, locale = 'id') {\n    if (value === null || value === undefined) return 0;\n    if (typeof value === 'number') {\n      if (!Number.isFinite(value)) throw new Error(`Angka tidak valid: \"${value}\"`);\n      return round2(value);\n    }\n    let s = String(value).replace(/[\\s\\u00A0]/g, '').replace(/^(rp\\.?|idr)/i, '');\n    if (s === '' || s === '-') return 0;\n    let neg = false;\n    if (/^\\(.*\\)$/.test(s)) { neg = true; s = s.slice(1, -1); }\n    if (s.startsWith('-')) { neg = true; s = s.slice(1); }\n    if (!/^[0-9.,]+$/.test(s)) throw new Error(`Angka tidak valid: \"${value}\"`);\n\n    let normalized;\n    if (locale === 'en') normalized = s.replace(/,/g, '');\n    else if (locale === 'auto') normalized = autoNormalize(s);\n    else normalized = s.replace(/\\./g, '').replace(',', '.');\n\n    const n = Number(normalized);\n    if (!Number.isFinite(n)) throw new Error(`Angka tidak valid: \"${value}\"`);\n    return round2(neg ? -n : n);\n  }\n\n  /** Terima yyyy-mm-dd, dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy -> 'yyyy-mm-dd' atau null. */\n  function parseDate(value) {\n    if (!value) return null;\n    const s = String(value).trim();\n    let y, m, d, mt;\n    if ((mt = s.match(/^(\\d{4})[-/.](\\d{1,2})[-/.](\\d{1,2})/))) { y = +mt[1]; m = +mt[2]; d = +mt[3]; }\n    else if ((mt = s.match(/^(\\d{1,2})[-/.](\\d{1,2})[-/.](\\d{4})/))) { d = +mt[1]; m = +mt[2]; y = +mt[3]; }\n    else return null;\n    const dt = new Date(Date.UTC(y, m - 1, d));\n    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;\n    return `${y}-${pad2(m)}-${pad2(d)}`;\n  }\n\n  /**\n   * NPWP -> hanya digit. NPWP lama 15 digit diberi awalan \"0\" agar setara\n   * format 16 digit (ASUMSI: verifikasi dengan ketentuan DJP terbaru).\n   */\n  function normalizeNpwp(value) {\n    const digits = String(value || '').replace(/\\D/g, '');\n    if (digits.length === 15) return '0' + digits;\n    return digits;\n  }\n\n  /** Nomor faktur/invoice -> huruf besar, buang semua tanda baca & spasi. */\n  function normalizeInvoiceNo(value) {\n    return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');\n  }\n\n  // ------------------------------------------------------------ Mapping\n  function mapRecords(rows, spec, opts, label, warnings) {\n    if (!rows.length) throw new Error(`${label}: file kosong atau tidak ada baris data.`);\n    const available = Object.keys(rows[0]).filter((k) => k !== '__row');\n    const lookup = {};\n    available.forEach((h) => { lookup[h.toLowerCase()] = h; });\n\n    const col = (std, required) => {\n      const wanted = spec.columns[std];\n      if (!wanted) {\n        if (required) throw new Error(`${label}: mapping kolom \"${std}\" belum diisi di config/mapping.json`);\n        return null;\n      }\n      const actual = lookup[String(wanted).trim().toLowerCase()];\n      if (!actual && required) {\n        throw new Error(`${label}: kolom \"${wanted}\" tidak ditemukan. Kolom tersedia: ${available.join(', ')}`);\n      }\n      return actual || null;\n    };\n    const cInv = col('invoice_no', true);\n    const cDpp = col('dpp', true);\n    const cPpn = col('ppn', true);\n    const cNpwp = col('npwp', false);\n    const cDate = col('date', false);\n\n    const records = [];\n    for (const r of rows) {\n      try {\n        const invoice = r[cInv];\n        if (!invoice) throw new Error('nomor dokumen kosong');\n        const date = cDate ? parseDate(r[cDate]) : null;\n        if (cDate && r[cDate] && !date) warnings.push({ source: label, row: r.__row, message: `Format tanggal tidak dikenali: \"${r[cDate]}\"` });\n        records.push({\n          row: r.__row,\n          invoice_no: invoice,\n          npwp: cNpwp ? normalizeNpwp(r[cNpwp]) : '',\n          date,\n          dpp: parseAmount(r[cDpp], opts.locale),\n          ppn: parseAmount(r[cPpn], opts.locale),\n          norm: {\n            invoice_no: normalizeInvoiceNo(invoice),\n            npwp: cNpwp ? normalizeNpwp(r[cNpwp]) : '',\n          },\n        });\n      } catch (e) {\n        warnings.push({ source: label, row: r.__row, message: `Baris dilewati: ${e.message}` });\n      }\n    }\n    return records;\n  }\n\n  // -------------------------------------------------------- Rekonsiliasi\n  /**\n   * Cocokkan dua daftar record berdasarkan kunci (default: nomor dokumen + NPWP).\n   * diff = A - B. Selisih <= tolerance dianggap pembulatan.\n   */\n  function reconcile(recA, recB, opts = {}) {\n    const tol = opts.tolerance !== undefined && opts.tolerance !== null ? Number(opts.tolerance) : 10;\n    const ppnRate = opts.ppnRate !== undefined && opts.ppnRate !== null ? Number(opts.ppnRate) : null;\n    const keyFields = opts.keyFields || ['invoice_no', 'npwp'];\n    const keyOf = (r) => keyFields.map((f) => r.norm[f] || '').join('|');\n\n    const group = (recs) => {\n      const m = new Map();\n      for (const r of recs) {\n        const k = keyOf(r);\n        if (!m.has(k)) m.set(k, []);\n        m.get(k).push(r);\n      }\n      return m;\n    };\n    const side = (g) => (g ? {\n      first: g[0],\n      count: g.length,\n      date: g[0].date,\n      dpp: round2(g.reduce((s, r) => s + r.dpp, 0)),\n      ppn: round2(g.reduce((s, r) => s + r.ppn, 0)),\n    } : null);\n\n    const gA = group(recA);\n    const gB = group(recB);\n    const keys = [...gA.keys(), ...[...gB.keys()].filter((k) => !gA.has(k))];\n\n    const results = keys.map((key) => {\n      const a = side(gA.get(key));\n      const b = side(gB.get(key));\n      const notes = [];\n      const dDpp = round2((a ? a.dpp : 0) - (b ? b.dpp : 0));\n      const dPpn = round2((a ? a.ppn : 0) - (b ? b.ppn : 0));\n      let status;\n\n      if (a && !b) { status = 'ONLY_IN_A'; notes.push('Tidak ditemukan di sumber B'); }\n      else if (!a && b) { status = 'ONLY_IN_B'; notes.push('Tidak ditemukan di sumber A'); }\n      else {\n        const within = Math.abs(dDpp) <= tol && Math.abs(dPpn) <= tol;\n        const exact = dDpp === 0 && dPpn === 0;\n        const periodDiff = !!(a.date && b.date && a.date.slice(0, 7) !== b.date.slice(0, 7));\n\n        if (a.count > 1 || b.count > 1) {\n          status = 'DUPLICATE_KEY';\n          notes.push(`Kunci muncul ${a.count}x di A dan ${b.count}x di B (nilai dijumlahkan)`);\n          if (!within) notes.push('Total berbeda melebihi toleransi');\n        } else if (!within) {\n          status = 'AMOUNT_MISMATCH';\n          if (Math.abs(dDpp) > tol) notes.push(`DPP berbeda ${dDpp}`);\n          if (Math.abs(dPpn) > tol) notes.push(`PPN berbeda ${dPpn}`);\n        } else if (periodDiff) {\n          status = 'PERIOD_MISMATCH';\n        } else {\n          status = exact ? 'MATCH' : 'MATCH_ROUNDING';\n          if (!exact) notes.push(`Selisih pembulatan (DPP ${dDpp}, PPN ${dPpn})`);\n        }\n        if (periodDiff) notes.push(`Masa berbeda: A ${a.date.slice(0, 7)} vs B ${b.date.slice(0, 7)}`);\n      }\n\n      if (ppnRate !== null) {\n        [['A', a], ['B', b]].forEach(([lbl, s]) => {\n          if (!s) return;\n          const expected = round2(s.dpp * ppnRate);\n          if (Math.abs(s.ppn - expected) > tol) notes.push(`PPN di ${lbl} tidak sesuai tarif ${ppnRate} (diharapkan ${expected}, tercatat ${s.ppn})`);\n        });\n      }\n\n      const any = (a || b).first;\n      return {\n        status,\n        invoice_no: (a ? a.first : b.first).invoice_no,\n        npwp: any.norm.npwp || any.npwp || '',\n        date_a: a ? a.date : null,\n        date_b: b ? b.date : null,\n        dpp_a: a ? a.dpp : null,\n        dpp_b: b ? b.dpp : null,\n        diff_dpp: dDpp,\n        ppn_a: a ? a.ppn : null,\n        ppn_b: b ? b.ppn : null,\n        diff_ppn: dPpn,\n        notes: notes.join('; '),\n        row_a: a ? a.first.row : null,\n        row_b: b ? b.first.row : null,\n      };\n    });\n\n    return results;\n  }\n\n  function summarize(results, recA, recB) {\n    const counts = {};\n    STATUSES.forEach((s) => { counts[s] = 0; });\n    results.forEach((r) => { counts[r.status]++; });\n    const sum = (recs, f) => round2(recs.reduce((s, r) => s + r[f], 0));\n    const ok = counts.MATCH + counts.MATCH_ROUNDING;\n    return {\n      counts,\n      total_keys: results.length,\n      matched_pct: results.length ? round2((ok / results.length) * 100) : 0,\n      sum_dpp_a: sum(recA, 'dpp'),\n      sum_dpp_b: sum(recB, 'dpp'),\n      sum_ppn_a: sum(recA, 'ppn'),\n      sum_ppn_b: sum(recB, 'ppn'),\n      net_diff_dpp: round2(sum(recA, 'dpp') - sum(recB, 'dpp')),\n      net_diff_ppn: round2(sum(recA, 'ppn') - sum(recB, 'ppn')),\n    };\n  }\n\n  function uuid() {\n    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {\n      const r = (Math.random() * 16) | 0;\n      return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);\n    });\n  }\n\n  /**\n   * Pipeline lengkap: teks CSV A + teks CSV B + config -> hasil.\n   * `results` sudah berbentuk baris tabel recon_results (siap insert ke Postgres).\n   */\n  function run(textA, textB, config) {\n    const warnings = [];\n    const opts = { locale: 'id', tolerance: 10, ppnRate: null, ...config };\n    const recA = mapRecords(parseCsv(textA), config.sourceA, opts, config.sourceA.label || 'Sumber A', warnings);\n    const recB = mapRecords(parseCsv(textB), config.sourceB, opts, config.sourceB.label || 'Sumber B', warnings);\n    const results = reconcile(recA, recB, opts);\n    const summary = summarize(results, recA, recB);\n    const runId = uuid();\n    const discrepancy = results.filter((r) => r.status !== 'MATCH' && r.status !== 'MATCH_ROUNDING');\n    return {\n      run_id: runId,\n      tolerance: opts.tolerance,\n      total_a: recA.length,\n      total_b: recB.length,\n      summary,\n      warnings,\n      discrepancy_count: discrepancy.length,\n      results: results.map((r) => ({ run_id: runId, ...r })),\n    };\n  }\n\n  return { STATUSES, parseCsv, toCsv, parseAmount, parseDate, normalizeNpwp, normalizeInvoiceNo, mapRecords, reconcile, summarize, run };\n})();\n\nif (typeof module !== 'undefined' && module.exports) module.exports = TaxRecon;\n\n\nconst DEFAULT_CONFIG = {\n  \"locale\": \"id\",\n  \"tolerance\": 10,\n  \"ppnRate\": null,\n  \"sourceA\": {\n    \"label\": \"Faktur Pajak\",\n    \"columns\": {\n      \"invoice_no\": \"nomor_faktur\",\n      \"npwp\": \"npwp_lawan\",\n      \"date\": \"tanggal\",\n      \"dpp\": \"dpp\",\n      \"ppn\": \"ppn\"\n    }\n  },\n  \"sourceB\": {\n    \"label\": \"Laporan Penjualan\",\n    \"columns\": {\n      \"invoice_no\": \"no_invoice\",\n      \"npwp\": \"npwp\",\n      \"date\": \"tgl\",\n      \"dpp\": \"dpp\",\n      \"ppn\": \"ppn\"\n    }\n  }\n};\n\n// ---- Bagian khusus n8n (glue) ----\nconst input = $input.first();\nconst body = (input.json && input.json.body) || {};\nconst binary = input.binary || {};\nif (!binary.fileA || !binary.fileB) {\n  throw new Error('Kirim multipart/form-data dengan 2 file CSV: \"fileA\" dan \"fileB\".');\n}\nconst bufA = await this.helpers.getBinaryDataBuffer(0, 'fileA');\nconst bufB = await this.helpers.getBinaryDataBuffer(0, 'fileB');\n\nconst config = { ...DEFAULT_CONFIG };\nif (body.tolerance !== undefined && body.tolerance !== '') config.tolerance = Number(body.tolerance);\nif (body.ppnRate !== undefined && body.ppnRate !== '') config.ppnRate = Number(body.ppnRate);\nif (body.locale) config.locale = String(body.locale);\n\nreturn [{ json: TaxRecon.run(bufA.toString('utf8'), bufB.toString('utf8'), config) }];\n"
+      },
+      "id": "482bfdf6-c4a8-77b6-b97a-361834ecec3e",
+      "name": "Parse and Reconcile",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "results",
+        "options": {}
+      },
+      "id": "4e59d847-6c5a-140a-58c9-58738f05324c",
+      "name": "Split Results",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        540,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "recon_results"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": null,
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "9b932fc1-f66d-5e5a-7801-451157043ccc",
+      "name": "Save Results",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "Postgres - taxrecon"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Siapkan data selisih untuk dijelaskan AI. Angka sudah final, AI hanya menjelaskan.\nconst d = $input.first().json;\nconst MAX_ROWS = 50;\nconst bad = d.results.filter((r) => r.status !== 'MATCH' && r.status !== 'MATCH_ROUNDING');\nbad.sort((x, y) => (Math.abs(y.diff_dpp) + Math.abs(y.diff_ppn)) - (Math.abs(x.diff_dpp) + Math.abs(x.diff_ppn)));\nconst rows = bad.slice(0, MAX_ROWS).map((r) => ({\n  nomor: r.invoice_no, npwp: r.npwp, status: r.status,\n  dpp_a: r.dpp_a, dpp_b: r.dpp_b, diff_dpp: r.diff_dpp,\n  ppn_a: r.ppn_a, ppn_b: r.ppn_b, diff_ppn: r.diff_ppn,\n  tanggal_a: r.date_a, tanggal_b: r.date_b, catatan: r.notes,\n}));\nconst prompt =\n  'Ringkasan: ' + JSON.stringify(d.summary) + '\\n\\n' +\n  'Daftar selisih (' + rows.length + ' dari ' + bad.length + ' ditampilkan, urut selisih terbesar):\\n' +\n  JSON.stringify(rows, null, 1);\nreturn [{ json: { discrepancy_count: d.discrepancy_count, prompt } }];"
+      },
+      "id": "f11df68b-31a0-ff6b-739b-e48a08fb85df",
+      "name": "Build Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6bfaff0d-1ffa-c2c1-fdb8-ea63ceb9338b",
+              "leftValue": "={{ $json.discrepancy_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4e19cfd0-7acb-c813-1357-62a14d55187e",
+      "name": "Ada Selisih?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "Kamu adalah asisten rekonsiliasi pajak untuk tim finance/tax di Indonesia.\n\nKamu menerima daftar selisih hasil pencocokan dua sumber dokumen (A dan B) dalam format JSON.\nSemua angka SUDAH dihitung oleh program. Tugasmu hanya menjelaskan, BUKAN menghitung ulang.\n\nATURAN:\n1. Jangan mengubah, membulatkan, atau menghitung ulang angka. Kutip angka persis seperti di data.\n2. Jangan mengarang fakta di luar data. Jika penyebab tidak bisa dipastikan dari data, tulis sebagai \"kemungkinan\".\n3. Jangan memberi kesimpulan hukum/perlakuan fiskal. Jika perlu, sarankan konfirmasi ke konsultan pajak atau peraturan terbaru.\n4. Jawab dalam Bahasa Indonesia, ringkas.\n\nFORMAT JAWABAN:\n- Satu paragraf ringkasan (jumlah selisih per status dan hal yang paling mendesak).\n- Lalu daftar per dokumen: `nomor dokumen` - status - kemungkinan penyebab - saran tindak lanjut.\n- Urutkan dari selisih terbesar.\n\nARTI STATUS:\n- AMOUNT_MISMATCH: nominal DPP/PPN berbeda melebihi toleransi (cek salah input, diskon/retur, kurs, pembulatan).\n- PERIOD_MISMATCH: nominal sama tetapi bulan/masa berbeda (cek cut-off, pencatatan terlambat).\n- ONLY_IN_A / ONLY_IN_B: dokumen hanya ada di salah satu sumber (belum dicatat, salah nomor/NPWP, dibatalkan).\n- DUPLICATE_KEY: kunci dokumen muncul lebih dari sekali (kemungkinan input ganda atau penggantian faktur)."
+            }
+          ]
+        }
+      },
+      "id": "42646f9b-3b25-21f3-e8f2-89f682aa57c5",
+      "name": "Explain Discrepancies",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        1060,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "options": {
+          "temperature": 0.1,
+          "maxTokensToSample": 2000
+        }
+      },
+      "id": "9d15477f-d781-c1cf-fb33-8560eac18469",
+      "name": "Bedrock Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAwsBedrock",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        520
+      ],
+      "credentials": {
+        "aws": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "AWS - Bedrock"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gabungkan hasil hitung (deterministik) + penjelasan AI.\nconst base = $('Parse and Reconcile').first().json;\nconst aiText = $input.first().json.text;\nconst explanation = base.discrepancy_count === 0\n  ? 'Tidak ada selisih yang perlu dijelaskan.'\n  : (aiText || 'Penjelasan AI tidak tersedia (cek koneksi Bedrock). Hasil perhitungan tetap valid.');\nconst top = base.results\n  .filter((r) => r.status !== 'MATCH' && r.status !== 'MATCH_ROUNDING')\n  .sort((x, y) => (Math.abs(y.diff_dpp) + Math.abs(y.diff_ppn)) - (Math.abs(x.diff_dpp) + Math.abs(x.diff_ppn)))\n  .slice(0, 20)\n  .map(({ run_id, ...rest }) => rest);\nreturn [{ json: {\n  run_id: base.run_id,\n  tolerance: base.tolerance,\n  total_a: base.total_a,\n  total_b: base.total_b,\n  summary: base.summary,\n  warnings: base.warnings,\n  discrepancy_count: base.discrepancy_count,\n  top_discrepancies: top,\n  ai_explanation: explanation,\n} }];"
+      },
+      "id": "fb22c3c1-f968-c3ef-564c-70d9b8dd5f02",
+      "name": "Assemble",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "05bd5660-1113-0459-fe78-4acc9ca69a90",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1600,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// summary harus berupa string JSON untuk kolom jsonb.\nconst j = $input.first().json;\nreturn [{ json: {\n  run_id: j.run_id, tolerance: j.tolerance, total_a: j.total_a, total_b: j.total_b,\n  summary: JSON.stringify(j.summary), ai_explanation: j.ai_explanation,\n} }];"
+      },
+      "id": "29f69681-8432-3285-65ae-5d3d6fbae378",
+      "name": "Prep Run Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "recon_runs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": null,
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "46bc6fbe-e333-e530-d855-99afd25b2e89",
+      "name": "Save Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1860,
+        460
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "GANTI_DENGAN_CREDENTIAL_ANDA",
+          "name": "Postgres - taxrecon"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "width": 760,
+        "height": 300,
+        "content": "## Tax Recon - Workflow 1: Rekonsiliasi\n1. Buat credential **Postgres** (database `taxrecon`) dan **AWS** (akses Bedrock), lalu pilih di node Save Results, Save Run, dan Bedrock Chat Model.\n2. Di node **Bedrock Chat Model**, pilih model yang sudah Anda aktifkan aksesnya di konsol Bedrock.\n3. Buat credential **Header Auth** (mis. Name `X-API-Key`, Value = kunci acak) di node Webhook Upload. Kirim 2 file CSV: `curl -H \"X-API-Key: <kunci>\" -F fileA=@a.csv -F fileB=@b.csv -F tolerance=10 <URL webhook>`\n4. **Angka dihitung node \"Parse and Reconcile\" (kode), bukan oleh AI.** AI hanya menjelaskan.\n5. Jangan edit kode di node Parse; ubah `src/core.js` lalu jalankan `npm run build:n8n`."
+      },
+      "id": "9f09aefd-0dd4-ed43-80dd-1a8415473b55",
+      "name": "Catatan",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        -160
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook Upload": {
+      "main": [
+        [
+          {
+            "node": "Parse and Reconcile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and Reconcile": {
+      "main": [
+        [
+          {
+            "node": "Split Results",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Results": {
+      "main": [
+        [
+          {
+            "node": "Save Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Prompt": {
+      "main": [
+        [
+          {
+            "node": "Ada Selisih?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ada Selisih?": {
+      "main": [
+        [
+          {
+            "node": "Explain Discrepancies",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assemble",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explain Discrepancies": {
+      "main": [
+        [
+          {
+            "node": "Assemble",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bedrock Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Explain Discrepancies",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prep Run Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Run Row": {
+      "main": [
+        [
+          {
+            "node": "Save Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

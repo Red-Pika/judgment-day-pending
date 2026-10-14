@@ -1,0 +1,20 @@
+flowchart TB
+  UP["Upload 2 file CSV<br/>curl / form / sistem lain"]
+  WEB["web/chat.html<br/>GitHub Pages / S3"]
+  CADDY["Caddy: HTTPS otomatis"]
+  subgraph N8N["n8n (Docker di EC2)"]
+    direction LR
+    WF1["Workflow 1<br/>Rekonsiliasi<br/>(hitung dengan KODE)"]
+    WF2["Workflow 2<br/>Chatbot<br/>(AI Agent)"]
+  end
+  PG[("PostgreSQL<br/>recon_runs, recon_results,<br/>n8n_chat_histories")]
+  BR["Amazon Bedrock<br/>LLM"]
+
+  UP -- "Header Auth" --> CADDY
+  WEB -- "Basic Auth" --> CADDY
+  CADDY --> WF1
+  CADDY --> WF2
+  WF1 -- "simpan hasil" --> PG
+  WF2 -- "tool SQL" --> PG
+  WF1 -- "jelaskan selisih" --> BR
+  WF2 -- "penalaran" --> BR

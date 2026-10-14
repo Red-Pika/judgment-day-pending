@@ -1,0 +1,25 @@
+{
+  "locale": "id",
+  "tolerance": 10,
+  "ppnRate": null,
+  "sourceA": {
+    "label": "Faktur Pajak",
+    "columns": {
+      "invoice_no": "nomor_faktur",
+      "npwp": "npwp_lawan",
+      "date": "tanggal",
+      "dpp": "dpp",
+      "ppn": "ppn"
+    }
+  },
+  "sourceB": {
+    "label": "Laporan Penjualan",
+    "columns": {
+      "invoice_no": "no_invoice",
+      "npwp": "npwp",
+      "date": "tgl",
+      "dpp": "dpp",
+      "ppn": "ppn"
+    }
+  }
+}

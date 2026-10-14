@@ -1,0 +1,12 @@
+{
+  "name": "tax-recon-ai",
+  "version": "1.0.0",
+  "description": "Rekonsiliasi dokumen pajak (selisih angka) + chatbot AI dengan n8n dan AWS Bedrock",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "recon": "node scripts/run-local.js",
+    "build:n8n": "node scripts/build-n8n.js"
+  },
+  "engines": { "node": ">=18" }
+}

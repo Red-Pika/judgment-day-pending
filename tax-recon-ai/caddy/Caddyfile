@@ -1,0 +1,4 @@
+# HTTPS otomatis (Let's Encrypt). Pastikan DNS domain mengarah ke IP server dan port 80/443 terbuka.
+{$N8N_DOMAIN} {
+	reverse_proxy n8n:5678
+}
