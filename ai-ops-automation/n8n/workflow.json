@@ -1,0 +1,324 @@
+{
+  "name": "AI-Assisted IT Ops - Alert Triage",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ops-alert",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "n1",
+      "name": "Alert Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        240
+      ],
+      "webhookId": "ops-alert"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPS_SERVICE_URL }}/triage",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Service-Token",
+              "value": "={{ $env.SERVICE_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "n2",
+      "name": "Triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        240
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CHAT_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Service-Token",
+              "value": "={{ $env.SERVICE_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({text: $json.markdown}) }}",
+        "options": {}
+      },
+      "id": "n3",
+      "name": "Post Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $('Triage').item.json.requires_approval }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n4",
+      "name": "Needs approval?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        720,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CHAT_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Service-Token",
+              "value": "={{ $env.SERVICE_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({text: 'APPROVAL REQUIRED for alert ' + $('Triage').item.json.alert_id + '. To decide, POST JSON {\"decision\": \"approved\" or \"rejected\", \"approver\": \"your name\"} to ' + $execution.resumeUrl + ' (expires in 15 min; no answer = rejected).'}) }}",
+        "options": {}
+      },
+      "id": "n5",
+      "name": "Post Approval Request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "httpMethod": "POST",
+        "options": {},
+        "limitWaitTime": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 15,
+        "resumeUnit": "minutes"
+      },
+      "id": "n6",
+      "name": "Wait for approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1200,
+        40
+      ],
+      "webhookId": "ops-approval"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPS_SERVICE_URL }}/approvals/{{ $('Triage').item.json.approval.id }}/decision",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Service-Token",
+              "value": "={{ $env.SERVICE_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({decision: $json.body?.decision || 'rejected', approver: $json.body?.approver || 'system-timeout'}) }}",
+        "options": {}
+      },
+      "id": "n7",
+      "name": "Record Decision",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CHAT_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Service-Token",
+              "value": "={{ $env.SERVICE_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({text: $json.message}) }}",
+        "options": {}
+      },
+      "id": "n8",
+      "name": "Post Outcome",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({chat_id: $env.TELEGRAM_CHAT_ID, text: 'Triage failed for an incoming alert - handle manually. Error: ' + ($json.error?.message || 'unknown')}) }}",
+        "options": {}
+      },
+      "id": "n9",
+      "name": "Post Failure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        360
+      ]
+    }
+  ],
+  "connections": {
+    "Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triage": {
+      "main": [
+        [
+          {
+            "node": "Post Report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Post Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Report": {
+      "main": [
+        [
+          {
+            "node": "Needs approval?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs approval?": {
+      "main": [
+        [
+          {
+            "node": "Post Approval Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Post Approval Request": {
+      "main": [
+        [
+          {
+            "node": "Wait for approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for approval": {
+      "main": [
+        [
+          {
+            "node": "Record Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Decision": {
+      "main": [
+        [
+          {
+            "node": "Post Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

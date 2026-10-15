@@ -1,0 +1,23 @@
+services:
+  ops-service:
+    build: .
+    env_file: .env
+    environment:
+      ENABLE_CHAT_SINK: "1"          # local stand-in for Slack/Teams; remove when using a real chat webhook
+    volumes: ["./data:/app/data"]
+    ports: ["8080:8080"]
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest   # pin a specific version for real use
+    ports: ["5678:5678"]
+    environment:
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"   # lets the workflow read OPS_SERVICE_URL / SERVICE_TOKEN
+      OPS_SERVICE_URL: http://ops-service:8080
+      CHAT_WEBHOOK_URL: http://ops-service:8080/notify   # fan-out: Telegram / Slack / email
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}        # only for the n8n failure path (independent of the service)
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      SERVICE_TOKEN: ${SERVICE_TOKEN}
+      WEBHOOK_URL: http://localhost:5678/
+    volumes: ["n8n_data:/home/node/.n8n"]
+    depends_on: [ops-service]
+volumes:
+  n8n_data:
