@@ -1,0 +1,32 @@
+name: AIOps ChatOps tests
+
+on:
+  push:
+    paths:
+      - "aiops-chatops/**"
+      - ".github/workflows/aiops-chatops.yml"
+  pull_request:
+    paths:
+      - "aiops-chatops/**"
+      - ".github/workflows/aiops-chatops.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aiops-chatops
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: aiops-chatops/requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python
+        run: python -m compileall -q app tests
+      - name: Run unit tests
+        run: pytest -q
